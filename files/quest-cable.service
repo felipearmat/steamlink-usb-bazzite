@@ -1,0 +1,12 @@
+[Unit]
+Description=Steam Link VR: send the Quest video over the USB cable when available
+
+[Service]
+ExecStart=%h/.local/bin/quest-cable-daemon
+# If the daemon dies without running its own cleanup, never leave the headset's Wi-Fi blocked.
+ExecStopPost=/bin/sh -c 'f="$XDG_RUNTIME_DIR/quest-cable.blocked-ip"; [ -s "$f" ] && sudo -n /usr/local/bin/quest-wifi-video-block off "$(cat "$f")"; rm -f "$f"'
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target

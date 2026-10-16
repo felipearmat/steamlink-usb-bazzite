@@ -1,0 +1,26 @@
+#!/bin/bash
+# Blocks/unblocks the Steam Link VR video port (UDP 10400) between this PC and the headset's
+# Wi-Fi address, so the vrlink driver can only use the USB link. Runtime rules only: they are
+# gone after a reboot or "off".
+#
+# Installed root-owned in /usr/local/bin and allowed without a password via
+# /etc/sudoers.d/quest-wifi-video-block, so the user service can call it (firewall-cmd itself
+# asks for an admin password through polkit).
+set -eu
+usage() { echo "usage: $0 on|off <headset-wifi-ipv4>" >&2; exit 2; }
+[ $# -eq 2 ] || usage
+ip=$2
+[[ $ip =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || { echo "invalid IPv4 address: $ip" >&2; exit 2; }
+rich="rule family=\"ipv4\" source address=\"$ip\" port port=\"10400\" protocol=\"udp\" drop"
+direct=(ipv4 filter OUTPUT 0 -d "$ip" -p udp --sport 10400 -j DROP)
+case $1 in
+  on)
+    firewall-cmd -q --query-rich-rule="$rich" || firewall-cmd -q --add-rich-rule="$rich"
+    firewall-cmd -q --direct --query-rule "${direct[@]}" || firewall-cmd -q --direct --add-rule "${direct[@]}"
+    ;;
+  off)
+    firewall-cmd -q --remove-rich-rule="$rich" 2>/dev/null || true
+    firewall-cmd -q --direct --remove-rule "${direct[@]}" 2>/dev/null || true
+    ;;
+  *) usage ;;
+esac

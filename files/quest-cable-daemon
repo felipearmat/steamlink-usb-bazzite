@@ -1,0 +1,123 @@
+#!/bin/bash
+# Steam Link VR over USB: sends the video through the USB cable whenever possible, keeping the
+# headset's Wi-Fi on (controllers, sign-in, discovery). Runs as the quest-cable user service, in
+# desktop mode or in the gamescope session.
+#
+# - No Quest on USB, no adb or the Steam Link app closed: does nothing (Wi-Fi left alone).
+# - App open with the cable plugged in: keeps the headset in USB networking (NCM) mode; Horizon OS
+#   sometimes switches back to MTP on its own, which removes the USB network.
+# - Blocks the video over Wi-Fi (UDP 10400, through quest-wifi-video-block) only when this
+#   vrserver's vrlink session is up, the headset has been streaming (VRLink activity) for
+#   STREAM_SETTLE seconds and the cable answers. Sessions are always established over Wi-Fi, so
+#   blocking earlier would prevent the connection.
+# - Any condition fails: unblocks right away and vrlink falls back to Wi-Fi instead of freezing.
+set -u
+
+CONF="${QUEST_CABLE_CONF:-$HOME/.config/quest-cable.conf}"
+# shellcheck source=/dev/null
+[ -r "$CONF" ] && . "$CONF"
+: "${ADB:=adb}"
+: "${HEADSET_IP:=10.86.13.37}"
+: "${STEAM_DIR:=$HOME/.local/share/Steam}"
+: "${NCM_MIN_INTERVAL:=15}"   # s between NCM switches (each one re-enumerates the headset's USB)
+: "${STREAM_SETTLE:=8}"       # s streaming before blocking the Wi-Fi video
+export PATH="$HOME/.local/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"
+
+PKG=com.valvesoftware.steamlinkvr
+QUEST_VENDOR=2833
+FW=/usr/local/bin/quest-wifi-video-block
+VRSERVER_LOG="$STEAM_DIR/logs/vrserver.txt"
+STATE="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/quest-cable.blocked-ip"
+
+log() { echo "$*"; }
+
+aq() { timeout 5 "$ADB" shell "$@" 2>/dev/null | tr -d '\r'; }
+quest_on_usb() { grep -qx "$QUEST_VENDOR" /sys/bus/usb/devices/*/idVendor 2>/dev/null; }
+adb_ok() { [ "$(timeout 5 "$ADB" get-state 2>/dev/null)" = device ]; }
+app_running() { [ -n "$(aq pidof "$PKG")" ]; }
+streaming() { aq "dumpsys activity activities | grep ResumedActivity" | grep -q "steamlink.VRLink"; }
+wifi_ip() { aq ip -4 -br addr show wlan0 | awk '{print $3}' | cut -d/ -f1; }
+
+# Network interface of the headset's NCM function (name depends on the machine).
+quest_iface() {
+  local n
+  for n in /sys/class/net/*; do
+    [ "$(cat "$(readlink -f "$n/device")/../idVendor" 2>/dev/null)" = "$QUEST_VENDOR" ] &&
+      { basename "$n"; return 0; }
+  done
+  return 1
+}
+cable_ok() {
+  local i
+  i=$(quest_iface) || return 1
+  ping -c1 -W1 -I "$i" "$HEADSET_IP" >/dev/null 2>&1
+}
+
+# vrserver.txt accumulates several runs: only a "Found primary link" after this vrserver's
+# startup line counts.
+session_linked() {
+  local pid
+  pid=$(pgrep -x vrserver | head -1)
+  [ -n "$pid" ] && awk -v s="startup with PID=$pid," \
+    '/startup with PID=/ {on = index($0, s) > 0} on && /Found primary link/ {f=1} END {exit !f}' \
+    "$VRSERVER_LOG" 2>/dev/null
+}
+
+blocked_ip() { cat "$STATE" 2>/dev/null; }
+block() {
+  sudo -n "$FW" on "$1" && echo "$1" > "$STATE" &&
+    log "video over USB (headset Wi-Fi $1 blocked on the video port)"
+}
+unblock() {
+  local ip
+  ip=$(blocked_ip)
+  [ -n "$ip" ] || return 0
+  sudo -n "$FW" off "$ip"
+  rm -f "$STATE"
+  log "Wi-Fi video unblocked ($1)"
+}
+
+trap 'unblock "service stopping"; exit 0' TERM INT
+unblock "leftover from a previous run"
+log "waiting for the Quest (adb: $ADB, headset USB IP: $HEADSET_IP)"
+
+last_ncm=0
+stream_since=0
+while :; do
+  if ! quest_on_usb || ! adb_ok || ! app_running; then
+    unblock "no Quest/adb or Steam Link closed"
+    stream_since=0
+    sleep 5
+    continue
+  fi
+
+  funcs=$(aq svc usb getFunctions)
+  if [ -n "$funcs" ] && [[ $funcs != *ncm* ]]; then
+    unblock "USB network down"
+    now=$(date +%s)
+    if (( now - last_ncm >= NCM_MIN_INTERVAL )); then
+      log "headset USB in '$funcs' mode: switching back to USB networking (NCM)"
+      aq svc usb setFunctions ncm >/dev/null
+      last_ncm=$now
+    fi
+    sleep 3
+    continue
+  fi
+
+  if streaming; then
+    (( stream_since )) || stream_since=$(date +%s)
+  else
+    stream_since=0
+  fi
+
+  if (( stream_since )) && (( $(date +%s) - stream_since >= STREAM_SETTLE )) &&
+     session_linked && cable_ok; then
+    if [ -z "$(blocked_ip)" ]; then
+      ip=$(wifi_ip)
+      [ -n "$ip" ] && block "$ip"
+    fi
+  else
+    unblock "not streaming, no session or cable not answering"
+  fi
+  sleep 2
+done
