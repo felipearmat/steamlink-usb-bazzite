@@ -6,6 +6,8 @@
 # - No Quest on USB, no adb or the Steam Link app closed: does nothing (Wi-Fi left alone).
 # - App open with the cable plugged in: keeps the headset in USB networking (NCM) mode; Horizon OS
 #   sometimes switches back to MTP on its own, which removes the USB network.
+# - Links LegacySteamRuntime into the default Steam library when Steam installed it elsewhere
+#   (otherwise SteamVR's compositor never starts).
 # - Blocks the video over Wi-Fi (UDP 10400, through quest-wifi-video-block) only when this
 #   vrserver's vrlink session is up, the headset has been streaming (VRLink activity) for
 #   STREAM_SETTLE seconds and the cable answers. Sessions are always established over Wi-Fi, so
@@ -63,6 +65,24 @@ session_linked() {
     "$VRSERVER_LOG" 2>/dev/null
 }
 
+# SteamVR's vrcompositor-launcher.sh looks for the LegacySteamRuntime tool only in Steam's
+# default library. With SteamVR in another library, Steam installs the tool there (the first
+# time SteamVR starts) and the compositor never starts: the stream drops right after
+# connecting. Keep a symlink in the default library whenever the tool lives elsewhere.
+ensure_legacy_runtime() {
+  local want="$STEAM_DIR/steamapps/common/LegacySteamRuntime" lib
+  [ -x "$want/legacy-steam-runtime" ] && return 0
+  while read -r lib; do
+    [ "$lib" = "$STEAM_DIR" ] && continue
+    if [ -x "$lib/steamapps/common/LegacySteamRuntime/legacy-steam-runtime" ]; then
+      mkdir -p "$STEAM_DIR/steamapps/common" &&
+        ln -sfn "$lib/steamapps/common/LegacySteamRuntime" "$want" &&
+        log "LegacySteamRuntime linked from $lib (SteamVR's compositor only looks in the default library)"
+      return 0
+    fi
+  done < <(grep -oP '"path"\s*"\K[^"]+' "$STEAM_DIR/steamapps/libraryfolders.vdf" 2>/dev/null)
+}
+
 blocked_ip() { cat "$STATE" 2>/dev/null; }
 block() {
   sudo -n "$FW" on "$1" && echo "$1" > "$STATE" &&
@@ -84,6 +104,9 @@ log "waiting for the Quest (adb: $ADB, headset USB IP: $HEADSET_IP)"
 last_ncm=0
 stream_since=0
 while :; do
+  # Needed over Wi-Fi too, so before any cable check (only a stat when the link exists).
+  ensure_legacy_runtime
+
   if ! quest_on_usb || ! adb_ok || ! app_running; then
     unblock "no Quest/adb or Steam Link closed"
     stream_since=0

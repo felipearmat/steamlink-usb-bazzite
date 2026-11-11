@@ -93,6 +93,30 @@ STEAM_DIR=""
 in_gamescope() { [ "${XDG_CURRENT_DESKTOP:-}" = gamescope ] || pgrep -x gamescope-wl >/dev/null; }
 steam_running() { pgrep -x steam >/dev/null; }
 
+# Closes Steam (desktop mode). Returns 1 if it is still running after 90 s.
+close_steam() {
+  steam_running || return 0
+  info "closing Steam..."
+  steam -shutdown >/dev/null 2>&1 &
+  local i
+  for i in $(seq 1 45); do steam_running || return 0; sleep 2; done
+  return 1
+}
+
+# Steam's update window (shown while a client update installs) blocks the whole client when the
+# screen is off on KDE Wayland: Steam then sits at "Installing update..." forever. It happens
+# when Steam is reopened over SSH or after the display went to sleep.
+reopen_hint() {
+  info "Reopen Steam with the screen on: while the display is off (DPMS) its update window"
+  info "hangs at \"Installing update...\". Over SSH, wake it first: kscreen-doctor --dpms on"
+}
+
+# Steam's default library plus every library listed in libraryfolders.vdf.
+steam_libraries() {
+  { echo "$STEAM_DIR"; grep -oP '"path"\s*"\K[^"]+' "$STEAM_DIR/steamapps/libraryfolders.vdf" 2>/dev/null; } |
+    awk '!seen[$0]++'
+}
+
 check_steam() {
   step "Steam client"
   local d
@@ -117,17 +141,12 @@ check_steam() {
   if in_gamescope; then
     pause "Switch to the beta there (Steam restarts by itself), then"
   elif ask "Switch the Steam client to the beta now? (closes Steam; it updates on the next start)"; then
-    if steam_running; then
-      info "closing Steam..."
-      steam -shutdown >/dev/null 2>&1 &
-      local i
-      for i in $(seq 1 45); do steam_running || break; sleep 2; done
-    fi
-    if steam_running; then
-      bad "Steam did not close; switch to the beta in the settings instead"
-    else
+    if close_steam; then
       echo "$want" > "$STEAM_DIR/package/beta"
       ok "beta set ($want). Open Steam and let it update before using VR."
+      reopen_hint
+    else
+      bad "Steam did not close; switch to the beta in the settings instead"
     fi
     return
   fi
@@ -136,6 +155,64 @@ check_steam() {
 
 # ---------------------------------------------------------------------------------------------
 STEAMVR_DIR=""
+steamvr_branch() {
+  local key
+  key=$(awk '/"UserConfig"/{u=1} u && /"BetaKey"/{gsub(/"/,"",$2); print $2; exit}' "$1")
+  echo "${key:-public}"
+}
+
+# Sets "BetaKey" "beta" in the UserConfig block of SteamVR's appmanifest (what the Betas tab
+# writes). Only with Steam closed: a running Steam rewrites the file. Keeps a .bak copy.
+set_steamvr_beta() {
+  cp -p "$1" "$1.bak" || return 1
+  python3 -I - "$1" <<'PY'
+import re, sys
+f = sys.argv[1]
+t = open(f, encoding="utf-8").read()
+m = re.search(r'("UserConfig"[ \t]*\n([ \t]*)\{)(.*?)(\n\2\})', t, re.S)
+if m:
+    body = m.group(3)
+    if re.search(r'"BetaKey"', body):
+        body = re.sub(r'"BetaKey"(\s*)"[^"]*"', r'"BetaKey"\1"beta"', body)
+    else:
+        body += '\n' + m.group(2) + '\t"BetaKey"\t\t"beta"'
+    t = t[:m.start()] + m.group(1) + body + m.group(4) + t[m.end():]
+else:
+    i = t.rstrip().rfind("}")
+    t = t[:i] + '\t"UserConfig"\n\t{\n\t\t"BetaKey"\t\t"beta"\n\t}\n' + t[i:]
+open(f, "w", encoding="utf-8").write(t)
+PY
+}
+
+# vrcompositor-launcher.sh looks for the LegacySteamRuntime tool (appid 4690330) only in Steam's
+# default library. When SteamVR lives in another library Steam installs the tool there, the
+# launcher falls back to ubuntu12_32/steam-runtime/run.sh (only a stub on current Steam betas)
+# and relaunches itself until "Argument list too long": the compositor never starts and the
+# stream drops. A symlink in the default library fixes it (the service keeps it in place too).
+check_legacy_runtime() {
+  local want="$STEAM_DIR/steamapps/common/LegacySteamRuntime" lib found=""
+  if [ -x "$want/legacy-steam-runtime" ]; then
+    ok "LegacySteamRuntime reachable from Steam's default library"
+    return 0
+  fi
+  while read -r lib; do
+    [ -x "$lib/steamapps/common/LegacySteamRuntime/legacy-steam-runtime" ] &&
+      { found="$lib/steamapps/common/LegacySteamRuntime"; break; }
+  done < <(steam_libraries)
+  if [ -z "$found" ]; then
+    warn "LegacySteamRuntime not installed yet (Steam adds it the first time SteamVR starts);"
+    info "the quest-cable service links it into the default library when it appears"
+    return 0
+  fi
+  if [ "$MODE" = check ]; then
+    bad "LegacySteamRuntime is in $found, but SteamVR's compositor only looks in $want"
+    return 0
+  fi
+  mkdir -p "$STEAM_DIR/steamapps/common" && ln -sfn "$found" "$want" &&
+    ok "LegacySteamRuntime linked into Steam's default library (SteamVR's compositor looks only there)" ||
+    bad "could not link $want -> $found"
+}
+
 check_steamvr() {
   step "SteamVR"
   local lib manifest=""
@@ -145,7 +222,7 @@ check_steamvr() {
       STEAMVR_DIR="$lib/steamapps/common/SteamVR"
       break
     fi
-  done < <( { echo "$STEAM_DIR"; grep -oP '"path"\s*"\K[^"]+' "$STEAM_DIR/steamapps/libraryfolders.vdf" 2>/dev/null; } | awk '!seen[$0]++')
+  done < <(steam_libraries)
   if [ -z "$manifest" ]; then
     bad "SteamVR is not installed"
     ask "Open the SteamVR install page in Steam?" && (steam "steam://install/$STEAMVR_APPID" >/dev/null 2>&1 &)
@@ -154,15 +231,29 @@ check_steamvr() {
   fi
   ok "SteamVR installed ($STEAMVR_DIR)"
 
-  local key
-  key=$(awk '/"UserConfig"/{u=1} u && /"BetaKey"/{gsub(/"/,"",$2); print $2; exit}' "$manifest")
-  # Since SteamVR 2.18 (Oct 2026) the stable branch carries the Linux/AMD streaming fixes.
-  case ${key:-} in
-    beta) ok "SteamVR on the beta branch" ;;
-    ""|public) ok "SteamVR on the stable branch (2.18+ is enough; the beta is optional)" ;;
-    *) warn "SteamVR is on '$key'; use the stable or the beta branch"
-       info "Library > SteamVR > Properties > Betas" ;;
-  esac
+  # The beta branch is required: on the stable branch (2.18.4, Nov 2026) the headset connects
+  # and the stream drops a few seconds later ("the PC stopped streaming"); 2.19 beta works.
+  if [ "$(steamvr_branch "$manifest")" = beta ]; then
+    ok "SteamVR on the beta branch"
+  else
+    warn "SteamVR is on '$(steamvr_branch "$manifest")': Steam Link VR on Linux needs the beta branch"
+    info "Library > SteamVR > Properties > Betas > \"beta - SteamVR Beta Update\""
+    if in_gamescope; then
+      pause "Switch SteamVR to the beta there and let it update, then"
+    elif ask "Switch SteamVR to the beta now? (closes Steam; SteamVR updates on the next start)"; then
+      if ! close_steam; then
+        bad "Steam did not close; switch SteamVR to the beta in its properties instead"
+      elif set_steamvr_beta "$manifest"; then
+        ok "SteamVR set to the beta. Open Steam and let SteamVR update before using VR."
+        reopen_hint
+      else
+        bad "could not edit $manifest; switch SteamVR to the beta in its properties instead"
+      fi
+    fi
+    [ "$(steamvr_branch "$manifest")" = beta ] || bad "SteamVR is not on the beta branch"
+  fi
+
+  check_legacy_runtime
 
   # Without this capability vrsetup.sh asks for it in a password dialog on every start; in
   # Gaming Mode that dialog is invisible and the connection just hangs.
@@ -336,7 +427,11 @@ check_usb_network() {
   funcs=$(aq svc usb getFunctions)
   if [[ $funcs != *ncm* ]]; then
     if [ "$MODE" = check ]; then
-      warn "headset USB is in '$funcs' mode now (the service switches it to NCM when Steam Link is open)"
+      if [ -z "$funcs" ]; then
+        warn "could not read the headset's USB mode right now (busy headset; the service retries)"
+      else
+        warn "headset USB is in '$funcs' mode now (the service switches it to NCM when Steam Link is open)"
+      fi
       return 0
     fi
     info "switching the headset USB to networking (NCM); it reconnects..."
@@ -517,6 +612,11 @@ uninstall() {
                    systemctl daemon-reload; udevadm control --reload" && ok "root files removed"
   fi
   [ -L "$BIN_DIR/adb" ] && info "adb was left in place ($BIN_DIR/adb -> $PT_DIR)."
+  local steam_dir lr
+  for steam_dir in "$HOME/.local/share/Steam" "$HOME/.steam/steam"; do
+    lr="$steam_dir/steamapps/common/LegacySteamRuntime"
+    [ -L "$lr" ] && { info "LegacySteamRuntime link left in place ($lr): SteamVR needs it."; break; }
+  done
   echo
   echo "Done."
 }
@@ -548,6 +648,10 @@ if (( ${#ISSUES[@]} == 0 )); then
   Plug the Quest in, open Steam Link in the headset and connect to this PC. A few seconds
   after the stream starts the service moves the video to the cable, and it falls back to
   Wi-Fi by itself if the cable stops answering. Nothing else to run.
+
+  First connection: the headset shows a PIN; type it in the dialog Steam opens on this PC's
+  screen (it is only asked once). Close any VR game started from the desktop before
+  connecting.
 
   Logs:    journalctl --user -u $UNIT -f
   Pause:   systemctl --user stop $UNIT   (until the next login)
