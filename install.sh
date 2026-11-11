@@ -18,6 +18,9 @@ UNIT_DIR=$HOME/.config/systemd/user
 UNIT=quest-cable.service
 HELPER=/usr/local/bin/quest-wifi-video-block
 SUDOERS=/etc/sudoers.d/quest-wifi-video-block
+SETCAP_HELPER=/usr/local/bin/steamvr-setcap
+SETCAP_UNIT=steamvr-setcap
+UDEV_RULE=/etc/udev/rules.d/51-meta-quest.rules
 NM_CON=quest-usb
 QUEST_VENDOR=2833
 PKG=com.valvesoftware.steamlinkvr
@@ -57,9 +60,14 @@ ask() {
 }
 pause() { [ "$MODE" = check ] || (( YES )) || read -r -p "  > $1 (Enter to continue) " _ < /dev/tty; }
 
-# Root commands: sudo in a terminal, the graphical polkit prompt otherwise (e.g. started from a
-# desktop shortcut).
-as_root() { if [ -t 0 ]; then sudo "$@"; else pkexec "$@"; fi; }
+# Root commands: sudo when it needs no password or there is a terminal, the graphical polkit
+# prompt otherwise (e.g. started from a desktop shortcut). Without the sudo -n check, a run over
+# SSH or from a script waits for a pkexec dialog on the local screen.
+as_root() {
+  if sudo -n true 2>/dev/null; then sudo -n "$@"
+  elif [ -t 0 ]; then sudo "$@"
+  else pkexec "$@"; fi
+}
 
 ADB=""
 aq() { timeout 8 "$ADB" shell "$@" 2>/dev/null | tr -d '\r'; }
@@ -148,12 +156,13 @@ check_steamvr() {
 
   local key
   key=$(awk '/"UserConfig"/{u=1} u && /"BetaKey"/{gsub(/"/,"",$2); print $2; exit}' "$manifest")
-  if [ "$key" = beta ]; then
-    ok "SteamVR on the beta branch"
-  else
-    warn "SteamVR is on '${key:-default}', the tested setup uses the beta branch"
-    info "Library > SteamVR > Properties > Betas > \"beta - SteamVR Beta Update\""
-  fi
+  # Since SteamVR 2.18 (Oct 2026) the stable branch carries the Linux/AMD streaming fixes.
+  case ${key:-} in
+    beta) ok "SteamVR on the beta branch" ;;
+    ""|public) ok "SteamVR on the stable branch (2.18+ is enough; the beta is optional)" ;;
+    *) warn "SteamVR is on '$key'; use the stable or the beta branch"
+       info "Library > SteamVR > Properties > Betas" ;;
+  esac
 
   # Without this capability vrsetup.sh asks for it in a password dialog on every start; in
   # Gaming Mode that dialog is invisible and the connection just hangs.
@@ -191,10 +200,15 @@ check_adb() {
   ADB=$(command -v adb || true)
   if [ -z "$ADB" ]; then
     warn "adb not found"
-    if command -v brew >/dev/null && ask "Install it with Homebrew (brew install android-platform-tools)?"; then
-      brew install android-platform-tools
-    elif ask "Download Google's platform-tools into $PT_DIR?"; then
+    # Google's "latest" zip first: the Homebrew cask pins a versioned URL that Google sometimes
+    # removes (404 for r37.0.2 in Nov 2026), so it is only the fallback.
+    if ask "Download Google's platform-tools into $PT_DIR?"; then
       install_adb_google || warn "download failed"
+    fi
+    hash -r
+    if ! command -v adb >/dev/null && command -v brew >/dev/null &&
+       ask "Try Homebrew instead (brew install android-platform-tools)?"; then
+      brew install android-platform-tools || warn "Homebrew install failed"
     fi
     hash -r
     ADB=$(command -v adb || true)
@@ -207,6 +221,29 @@ check_adb() {
 
 # ---------------------------------------------------------------------------------------------
 quest_on_usb() { grep -qx "$QUEST_VENDOR" /sys/bus/usb/devices/*/idVendor 2>/dev/null; }
+
+# Bazzite ships no udev rule for the Quest (vendor 2833), so adb cannot open it as a normal user.
+# A local rule works right away, without layering android-udev-rules and rebooting.
+check_udev() {
+  step "USB access to the Quest (udev)"
+  if grep -qs "$QUEST_VENDOR" /etc/udev/rules.d/*.rules /usr/lib/udev/rules.d/*.rules; then
+    ok "udev rule for the Quest present"
+    return 0
+  fi
+  [ "$MODE" = check ] && { bad "no udev rule for the Quest: adb will report 'no permissions'"; return 0; }
+  ask "Install $UDEV_RULE so adb can reach the Quest without root (sudo)?" ||
+    { bad "no udev rule for the Quest"; return 1; }
+  local tmp
+  tmp=$(mktemp)
+  echo "SUBSYSTEM==\"usb\", ATTR{idVendor}==\"$QUEST_VENDOR\", MODE=\"0660\", GROUP=\"wheel\", TAG+=\"uaccess\"" > "$tmp"
+  if as_root sh -c "install -m 0644 -o root -g root '$tmp' '$UDEV_RULE' && udevadm control --reload &&
+                    udevadm trigger --subsystem-match=usb --attr-match=idVendor=$QUEST_VENDOR"; then
+    ok "udev rule installed (unplug and replug the headset if it was already connected)"
+  else
+    bad "udev rule installation failed"
+  fi
+  rm -f "$tmp"
+}
 
 check_quest() {
   step "Quest connection"
@@ -234,7 +271,7 @@ check_quest() {
           info "Put the headset on and accept \"Allow USB debugging\" (tick \"Always allow\")." ;;
         perms)
           warn "no permission to open the headset over USB (udev rules)"
-          info "Install the Android udev rules (rpm-ostree install android-udev-rules) and reboot." ;;
+          info "Run this script again and accept the udev rule, then replug the headset." ;;
         noadb)
           warn "the Quest is on USB but adb does not see it"
           info "Enable Developer Mode: Meta Horizon phone app > Devices > Headset settings >"
@@ -380,6 +417,56 @@ install_root_files() {
   if (( rc == 0 )) && sudo -n -l "$HELPER" >/dev/null 2>&1; then ok "installed"; else bad "firewall helper installation failed"; fi
 }
 
+# SteamVR updates replace vrcompositor-launcher and drop cap_sys_nice: a root path unit grants it
+# again after every install/update, so SteamVR never starts asking for a password later on.
+install_setcap_watch() {
+  step "Keep cap_sys_nice across SteamVR updates"
+  [ -n "$STEAMVR_DIR" ] || { warn "SteamVR not found: skipped"; return 0; }
+  local launcher="$STEAMVR_DIR/bin/linux64/vrcompositor-launcher"
+  local manifest="${STEAMVR_DIR%/common/SteamVR}/appmanifest_$STEAMVR_APPID.acf"
+  if cmp -s "$HERE/files/steamvr-setcap" "$SETCAP_HELPER" &&
+     grep -qsF "$launcher" "/etc/systemd/system/$SETCAP_UNIT.path" &&
+     systemctl is-enabled -q "$SETCAP_UNIT.path" 2>/dev/null; then
+    ok "$SETCAP_UNIT.path already watching SteamVR"
+    return 0
+  fi
+  [ "$MODE" = check ] && { bad "$SETCAP_UNIT.path not installed (capability lost on SteamVR updates)"; return 0; }
+  ask "Install $SETCAP_UNIT.path to re-grant the capability after SteamVR updates (sudo)?" ||
+    { warn "skipped: re-run this script after SteamVR updates"; return 0; }
+  local tmp
+  tmp=$(mktemp -d)
+  cat > "$tmp/svc" <<EOF
+[Unit]
+Description=SteamVR: grant cap_sys_nice to vrcompositor-launcher (steamlink-usb-bazzite)
+
+[Service]
+Type=oneshot
+# Steam writes the files in several steps; give it a moment.
+ExecStartPre=/bin/sleep 5
+ExecStart=$SETCAP_HELPER "$launcher"
+EOF
+  cat > "$tmp/path" <<EOF
+[Unit]
+Description=Watch SteamVR to keep cap_sys_nice after updates (steamlink-usb-bazzite)
+
+[Path]
+PathChanged=$launcher
+PathChanged=$manifest
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  if as_root sh -c "install -m 0755 -o root -g root '$HERE/files/steamvr-setcap' '$SETCAP_HELPER' &&
+                    install -m 0644 '$tmp/svc' /etc/systemd/system/$SETCAP_UNIT.service &&
+                    install -m 0644 '$tmp/path' /etc/systemd/system/$SETCAP_UNIT.path &&
+                    systemctl daemon-reload && systemctl enable --now $SETCAP_UNIT.path"; then
+    ok "installed"
+  else
+    bad "$SETCAP_UNIT.path installation failed"
+  fi
+  rm -rf "$tmp"
+}
+
 install_service() {
   step "quest-cable service"
   if [ "$MODE" = check ]; then
@@ -422,8 +509,12 @@ uninstall() {
   systemctl --user daemon-reload
   ok "user files removed"
   nmcli connection delete "$NM_CON" >/dev/null 2>&1 && ok "NetworkManager profile removed"
-  if [ -e "$HELPER" ] && ask "Remove $HELPER and $SUDOERS (sudo)?"; then
-    as_root rm -f "$HELPER" "$SUDOERS" && ok "root files removed"
+  if { [ -e "$HELPER" ] || [ -e "$SETCAP_HELPER" ] || [ -e "$UDEV_RULE" ]; } &&
+     ask "Remove $HELPER, $SUDOERS, $SETCAP_UNIT.path and $UDEV_RULE (sudo)?"; then
+    as_root sh -c "systemctl disable --now $SETCAP_UNIT.path 2>/dev/null
+                   rm -f '$HELPER' '$SUDOERS' '$SETCAP_HELPER' /etc/systemd/system/$SETCAP_UNIT.path \
+                         /etc/systemd/system/$SETCAP_UNIT.service '$UDEV_RULE'
+                   systemctl daemon-reload; udevadm control --reload" && ok "root files removed"
   fi
   [ -L "$BIN_DIR/adb" ] && info "adb was left in place ($BIN_DIR/adb -> $PT_DIR)."
   echo
@@ -439,12 +530,14 @@ check_system
 check_steam
 check_steamvr
 check_adb
+check_udev
 if check_quest; then
   check_quest_app
   check_usb_network
 fi
 setup_nm_profile
 install_root_files
+install_setcap_watch
 install_service
 
 step "Summary"

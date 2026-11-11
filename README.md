@@ -12,7 +12,8 @@ freezing. It works the same in desktop mode and in Gaming Mode (gamescope).
 ## Requirements
 
 - Bazzite (other Fedora Atomic images should work), native Steam.
-- Steam client on the beta channel, SteamVR installed (beta branch recommended).
+- Steam client on the beta channel, SteamVR installed (2.18 or newer; the stable branch now carries
+  the AMD streaming fixes that used to be beta-only).
 - Meta Quest with **Developer Mode** enabled and **Steam Link** installed (beta channel).
 - A USB **data** cable (USB 3 recommended).
 
@@ -54,6 +55,8 @@ systemctl --user stop quest-cable         # pause until the next login
 | `quest-wifi-video-block` | `/usr/local/bin` | Adds/removes the two firewall rules (runtime only). |
 | sudoers rule | `/etc/sudoers.d/quest-wifi-video-block` | Lets the service run only that helper without a password. |
 | `quest-usb` profile | NetworkManager | Static address on the headset's USB network. |
+| `51-meta-quest.rules` | `/etc/udev/rules.d` | Lets adb open the Quest as your user (no reboot needed). |
+| `steamvr-setcap` + `.path` unit | `/usr/local/bin`, `/etc/systemd/system` | Re-grants `cap_sys_nice` to SteamVR's compositor after every SteamVR update. |
 
 Every couple of seconds the daemon checks, in this order:
 
@@ -69,6 +72,19 @@ service stops, and they never survive a reboot.
 
 ## Notes
 
+- **Valve's own USB mode.** SteamVR 2.18 (October 2026) added official wired USB support for the
+  Quest in Steam Link, built on the same USB networking (NCM). It was announced for Windows and
+  has not been confirmed on Linux yet. This service does not get in its way: if the official
+  mode already sends the video over the cable, blocking the Wi-Fi video port changes nothing; if
+  it does not, the service still moves the video to the cable.
+- **adb.** The installer downloads Google's `platform-tools-latest-linux.zip` first. The
+  Homebrew cask (`android-platform-tools`) pins a versioned URL that Google sometimes removes
+  (it returned 404 in November 2026), so it is only offered as a fallback.
+- **SteamVR updates.** Each update replaces `vrcompositor-launcher` and drops `cap_sys_nice`;
+  the `steamvr-setcap.path` unit grants it again automatically, so SteamVR does not start
+  asking for a password (an invisible dialog in Gaming Mode) after an update.
+- **Beat Saber black screen.** If the game shows a black void through Steam Link, the usual fix
+  on Linux is the legacy 1.40.8 build (Properties > Betas).
 - **Bazzite-Deck: the Steam beta channel also moves the OS to `:testing`.** On the `bazzite-deck`
   images, Steam in the beta channel (shown as "RC" in the client) calls `steamos-select-branch
   beta` every time its UI loads, and Bazzite maps that to a rebase to the `:testing` image
@@ -76,7 +92,9 @@ service stops, and they never survive a reboot.
   [#1543](https://github.com/ublue-os/bazzite/issues/1543)). Steam Link VR needs the Steam beta,
   so expect the OS to follow it. To stay on `:stable` anyway you can switch the Steam client
   back to stable (Steam Link VR then stops working) or try denying the `pkexec` call to
-  `steamos-polkit-helpers/steamos-select-branch` with a polkit rule (not tested here).
+  `steamos-polkit-helpers/steamos-select-branch` with a polkit rule (not tested here). The
+  desktop images (`bazzite`, KDE/GNOME) do not ship that hook: a desktop install with the Steam
+  beta stayed on `:stable` (tested November 2026).
 - If the headset shows **"Allow access to data?"** / file transfer, dismiss it: accepting switches
   the USB to MTP (the service switches it back, but the stream briefly falls back to Wi-Fi).
 - Leaving the stream (Meta button > quit, or restarting SteamVR) unblocks Wi-Fi; reconnecting

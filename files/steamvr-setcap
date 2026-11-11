@@ -1,0 +1,15 @@
+#!/bin/bash
+# Grants cap_sys_nice to SteamVR's vrcompositor-launcher if it lacks it. Every SteamVR update
+# replaces that file and drops the capability; without it vrsetup.sh asks for a password on each
+# start (invisible in Gaming Mode, where the connection just hangs).
+#
+# Installed root-owned in /usr/local/bin and run by steamvr-setcap.path whenever SteamVR changes.
+#   steamvr-setcap <path to vrcompositor-launcher>
+set -u
+f=${1:?usage: $0 <path to vrcompositor-launcher>}
+[[ $f == */SteamVR/bin/linux64/vrcompositor-launcher ]] || { echo "unexpected path: $f" >&2; exit 2; }
+[ -f "$f" ] || exit 0
+getcap=$(command -v getcap || echo /usr/sbin/getcap)
+setcap=$(command -v setcap || echo /usr/sbin/setcap)
+"$getcap" "$f" | grep -q cap_sys_nice && exit 0
+"$setcap" CAP_SYS_NICE=eip "$f" && logger -t steamvr-setcap "cap_sys_nice granted to $f"
