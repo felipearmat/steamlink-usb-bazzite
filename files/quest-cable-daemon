@@ -8,11 +8,15 @@
 #   sometimes switches back to MTP on its own, which removes the USB network.
 # - Links LegacySteamRuntime into the default Steam library when Steam installed it elsewhere
 #   (otherwise SteamVR's compositor never starts).
-# - Blocks the video over Wi-Fi (UDP 10400, through quest-wifi-video-block) only when this
-#   vrserver's vrlink session is up, the headset has been streaming (VRLink activity) for
-#   STREAM_SETTLE seconds and the cable answers. Sessions are always established over Wi-Fi, so
-#   blocking earlier would prevent the connection.
-# - Any condition fails: unblocks right away and vrlink falls back to Wi-Fi instead of freezing.
+# - While Steam Link is in the foreground of an awake headset: turns the PC's screen on and holds
+#   an idle inhibitor. With the screen off (DPMS) Steam answers discovery but the headset never
+#   sends its connection request, and Steam's update window hangs the whole client.
+# - Current SteamVR ("Uber link", 2.18+) streams over every link at once, cable included, and
+#   breaks if the Wi-Fi link is blocked (vrlink restarts its Wi-Fi socket every second and the
+#   image freezes). So by default (BLOCK_WIFI_VIDEO=auto) the Wi-Fi video is only blocked for an
+#   older vrlink without Uber link: then only when this vrserver's session is up, the headset has
+#   been streaming for STREAM_SETTLE seconds and the cable answers, and it is unblocked at once
+#   when any of that stops being true.
 set -u
 
 CONF="${QUEST_CABLE_CONF:-$HOME/.config/quest-cable.conf}"
@@ -23,6 +27,8 @@ CONF="${QUEST_CABLE_CONF:-$HOME/.config/quest-cable.conf}"
 : "${STEAM_DIR:=$HOME/.local/share/Steam}"
 : "${NCM_MIN_INTERVAL:=15}"   # s between NCM switches (each one re-enumerates the headset's USB)
 : "${STREAM_SETTLE:=8}"       # s streaming before blocking the Wi-Fi video
+: "${BLOCK_WIFI_VIDEO:=auto}" # auto (only without Uber link), yes or no
+: "${KEEP_SCREEN_ON:=yes}"    # wake the screen and inhibit idle while Steam Link is in use
 export PATH="$HOME/.local/bin:/home/linuxbrew/.linuxbrew/bin:$PATH"
 
 PKG=com.valvesoftware.steamlinkvr
@@ -38,6 +44,12 @@ quest_on_usb() { grep -qx "$QUEST_VENDOR" /sys/bus/usb/devices/*/idVendor 2>/dev
 adb_ok() { [ "$(timeout 5 "$ADB" get-state 2>/dev/null)" = device ]; }
 app_running() { [ -n "$(aq pidof "$PKG")" ]; }
 streaming() { aq "dumpsys activity activities | grep ResumedActivity" | grep -q "steamlink.VRLink"; }
+# Steam Link is what the user sees: headset awake and the app on top (menu or stream). A headset
+# taken off goes to sleep, so a forgotten app does not keep the PC awake.
+app_in_use() {
+  aq "dumpsys power | grep -m1 mWakefulness=" | grep -q Awake &&
+    aq "dumpsys activity activities | grep -m1 topResumedActivity" | grep -q "$PKG"
+}
 wifi_ip() { aq ip -4 -br addr show wlan0 | awk '{print $3}' | cut -d/ -f1; }
 
 # Network interface of the headset's NCM function (name depends on the machine).
@@ -83,6 +95,51 @@ ensure_legacy_runtime() {
   done < <(grep -oP '"path"\s*"\K[^"]+' "$STEAM_DIR/steamapps/libraryfolders.vdf" 2>/dev/null)
 }
 
+# True when this vrserver's vrlink runs the "Uber link" (all links at once, cable included).
+uber_link() {
+  local pid
+  pid=$(pgrep -x vrserver | head -1)
+  [ -n "$pid" ] && awk -v s="startup with PID=$pid," \
+    '/startup with PID=/ {on = index($0, s) > 0} on && /Uber link enabled/ {f=1} END {exit !f}' \
+    "$VRSERVER_LOG" 2>/dev/null
+}
+want_block() {
+  case $BLOCK_WIFI_VIDEO in
+    yes) return 0 ;;
+    no) return 1 ;;
+    *) ! uber_link ;;
+  esac
+}
+
+# --- screen ------------------------------------------------------------------------------------
+INHIBIT_PID=""
+wake_screen() {
+  local w
+  command -v kscreen-doctor >/dev/null || return 0
+  w=${WAYLAND_DISPLAY:-$(find "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}" -maxdepth 1 -name 'wayland-[0-9]*' \
+       ! -name '*.lock' -printf '%f\n' 2>/dev/null | head -1)}
+  [ -n "$w" ] || return 0
+  WAYLAND_DISPLAY=$w kscreen-doctor --dpms show 2>/dev/null | grep -q ': off' || return 0
+  WAYLAND_DISPLAY=$w kscreen-doctor --dpms on >/dev/null 2>&1 && log "screen woken up (Steam Link in use)"
+}
+hold_screen() {
+  [ "$KEEP_SCREEN_ON" = yes ] || return 0
+  wake_screen
+  if [ -z "$INHIBIT_PID" ] || ! kill -0 "$INHIBIT_PID" 2>/dev/null; then
+    systemd-inhibit --what=idle --who=quest-cable --mode=block \
+      --why="Steam Link is open in the headset" sleep infinity &
+    INHIBIT_PID=$!
+    log "keeping the screen on while Steam Link is in use"
+  fi
+}
+release_screen() {
+  [ -n "$INHIBIT_PID" ] || return 0
+  kill "$INHIBIT_PID" 2>/dev/null
+  wait "$INHIBIT_PID" 2>/dev/null
+  INHIBIT_PID=""
+  log "screen released ($1)"
+}
+
 blocked_ip() { cat "$STATE" 2>/dev/null; }
 block() {
   sudo -n "$FW" on "$1" && echo "$1" > "$STATE" &&
@@ -97,9 +154,9 @@ unblock() {
   log "Wi-Fi video unblocked ($1)"
 }
 
-trap 'unblock "service stopping"; exit 0' TERM INT
+trap 'unblock "service stopping"; release_screen "service stopping"; exit 0' TERM INT
 unblock "leftover from a previous run"
-log "waiting for the Quest (adb: $ADB, headset USB IP: $HEADSET_IP)"
+log "waiting for the Quest (adb: $ADB, headset USB IP: $HEADSET_IP, block Wi-Fi video: $BLOCK_WIFI_VIDEO)"
 
 last_ncm=0
 stream_since=0
@@ -109,10 +166,13 @@ while :; do
 
   if ! quest_on_usb || ! adb_ok || ! app_running; then
     unblock "no Quest/adb or Steam Link closed"
+    release_screen "no Quest/adb or Steam Link closed"
     stream_since=0
     sleep 5
     continue
   fi
+
+  if app_in_use; then hold_screen; else release_screen "headset asleep or Steam Link in background"; fi
 
   funcs=$(aq svc usb getFunctions)
   if [ -n "$funcs" ] && [[ $funcs != *ncm* ]]; then
@@ -134,7 +194,7 @@ while :; do
   fi
 
   if (( stream_since )) && (( $(date +%s) - stream_since >= STREAM_SETTLE )) &&
-     session_linked && cable_ok; then
+     session_linked && want_block && cable_ok; then
     if [ -z "$(blocked_ip)" ]; then
       ip=$(wifi_ip)
       [ -n "$ip" ] && block "$ip"
