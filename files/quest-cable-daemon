@@ -8,9 +8,9 @@
 #   sometimes switches back to MTP on its own, which removes the USB network.
 # - Links LegacySteamRuntime into the default Steam library when Steam installed it elsewhere
 #   (otherwise SteamVR's compositor never starts).
-# - While Steam Link is in the foreground of an awake headset: turns the PC's screen on and holds
-#   an idle inhibitor. With the screen off (DPMS) Steam answers discovery but the headset never
-#   sends its connection request, and Steam's update window hangs the whole client.
+# - While a Quest is plugged in and awake: turns the PC's screen on and holds an idle inhibitor
+#   (keeps the session active). With the screen off (DPMS) Steam answers discovery but the
+#   headset never sends its connection request, and Steam's update window hangs the client.
 # - Current SteamVR ("Uber link", 2.18+) streams over every link at once, cable included, and
 #   breaks if the Wi-Fi link is blocked (vrlink restarts its Wi-Fi socket every second and the
 #   image freezes). So by default (BLOCK_WIFI_VIDEO=auto) the Wi-Fi video is only blocked for an
@@ -44,12 +44,8 @@ quest_on_usb() { grep -qx "$QUEST_VENDOR" /sys/bus/usb/devices/*/idVendor 2>/dev
 adb_ok() { [ "$(timeout 5 "$ADB" get-state 2>/dev/null)" = device ]; }
 app_running() { [ -n "$(aq pidof "$PKG")" ]; }
 streaming() { aq "dumpsys activity activities | grep ResumedActivity" | grep -q "steamlink.VRLink"; }
-# Steam Link is what the user sees: headset awake and the app on top (menu or stream). A headset
-# taken off goes to sleep, so a forgotten app does not keep the PC awake.
-app_in_use() {
-  aq "dumpsys power | grep -m1 mWakefulness=" | grep -q Awake &&
-    aq "dumpsys activity activities | grep -m1 topResumedActivity" | grep -q "$PKG"
-}
+# Headset in use: awake (a headset taken off or left charging goes to sleep within minutes).
+headset_awake() { aq "dumpsys power | grep -m1 mWakefulness=" | grep -q Awake; }
 wifi_ip() { aq ip -4 -br addr show wlan0 | awk '{print $3}' | cut -d/ -f1; }
 
 # Network interface of the headset's NCM function (name depends on the machine).
@@ -120,16 +116,16 @@ wake_screen() {
        ! -name '*.lock' -printf '%f\n' 2>/dev/null | head -1)}
   [ -n "$w" ] || return 0
   WAYLAND_DISPLAY=$w kscreen-doctor --dpms show 2>/dev/null | grep -q ': off' || return 0
-  WAYLAND_DISPLAY=$w kscreen-doctor --dpms on >/dev/null 2>&1 && log "screen woken up (Steam Link in use)"
+  WAYLAND_DISPLAY=$w kscreen-doctor --dpms on >/dev/null 2>&1 && log "screen woken up (Quest connected and awake)"
 }
 hold_screen() {
   [ "$KEEP_SCREEN_ON" = yes ] || return 0
   wake_screen
   if [ -z "$INHIBIT_PID" ] || ! kill -0 "$INHIBIT_PID" 2>/dev/null; then
     systemd-inhibit --what=idle --who=quest-cable --mode=block \
-      --why="Steam Link is open in the headset" sleep infinity &
+      --why="Quest connected and awake" sleep infinity &
     INHIBIT_PID=$!
-    log "keeping the screen on while Steam Link is in use"
+    log "keeping the session active and the screen on (Quest connected and awake)"
   fi
 }
 release_screen() {
@@ -164,15 +160,24 @@ while :; do
   # Needed over Wi-Fi too, so before any cable check (only a stat when the link exists).
   ensure_legacy_runtime
 
-  if ! quest_on_usb || ! adb_ok || ! app_running; then
-    unblock "no Quest/adb or Steam Link closed"
-    release_screen "no Quest/adb or Steam Link closed"
+  if ! quest_on_usb || ! adb_ok; then
+    unblock "no Quest on USB/adb"
+    release_screen "no Quest on USB/adb"
     stream_since=0
     sleep 5
     continue
   fi
 
-  if app_in_use; then hold_screen; else release_screen "headset asleep or Steam Link in background"; fi
+  # Quest plugged in and awake: keep the PC session active and the screen on, so opening Steam
+  # Link in the headset always finds a PC that answers.
+  if headset_awake; then hold_screen; else release_screen "headset asleep"; fi
+
+  if ! app_running; then
+    unblock "Steam Link closed"
+    stream_since=0
+    sleep 5
+    continue
+  fi
 
   funcs=$(aq svc usb getFunctions)
   if [ -n "$funcs" ] && [[ $funcs != *ncm* ]]; then
