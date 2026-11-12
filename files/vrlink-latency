@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+# Per-stage latency of a Steam Link VR session, from the frame-timing CSV files SteamVR's vrlink
+# driver writes on its own (~/.local/share/Steam/logs/vrlink_aftm_*.csv; each file holds up to
+# ~4000 recent frames, dumped at session events).
+#
+#   vrlink-latency              latest non-trivial CSV
+#   vrlink-latency --all        every CSV, one block each
+#   vrlink-latency FILE...      the given files
+import csv, glob, os, statistics as st, sys
+
+LOGS = os.path.expanduser("~/.local/share/Steam/logs")
+STEPS = [
+    ("WGP Release", "VrCompositor GPU Done", "game + compositor (PC)"),
+    ("Encode Start", "Encode End", "encode (PC)"),
+    ("Send Start", "Receive", "network"),
+    ("Decode Start", "Decode End", "decode (headset)"),
+    ("Decode End", "Submit Illumination", "hold before display (headset)"),
+    ("WGP Release", "Predicted Display", "TOTAL"),
+]
+
+def files(args):
+    found = sorted((f for f in glob.glob(f"{LOGS}/vrlink_aftm_*.csv") if os.path.getsize(f) > 2000),
+                   key=os.path.getmtime)
+    if args == ["--all"]:
+        return found
+    return args or found[-1:]
+
+def report(path):
+    rows = list(csv.DictReader(open(path)))
+    num = lambda r, k: int(r[k]) if r.get(k, "").isdigit() and int(r[k]) else None
+    # Rows are not always in time order: use the median gap between consecutive frames.
+    ts = sorted(set(t for t in (num(r, "WGP Release") for r in rows) if t))
+    gaps = [b - a for a, b in zip(ts, ts[1:]) if b > a]
+    hz = 1e6 / st.median(gaps) if gaps else 0
+    print(f"{os.path.basename(path)}: {len(rows)} frames, ~{hz:.0f} Hz   (median / p95)")
+    for a, b, name in STEPS:
+        v = sorted((y - x) / 1000 for x, y in ((num(r, a), num(r, b)) for r in rows) if x and y)
+        if v:
+            print(f"  {name:31} {st.median(v):6.1f} ms  {v[int(len(v) * .95)]:6.1f} ms")
+
+paths = files(sys.argv[1:])
+if not paths:
+    sys.exit(f"no vrlink_aftm_*.csv with data in {LOGS} (connect once with Steam Link first)")
+for p in paths:
+    report(p)

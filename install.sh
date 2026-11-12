@@ -576,6 +576,7 @@ install_service() {
   [ -n "$ADB" ] || { bad "service not installed: adb is missing"; return 1; }
   mkdir -p "$BIN_DIR" "$UNIT_DIR"
   install -m 0755 "$HERE/files/quest-cable-daemon" "$BIN_DIR/quest-cable-daemon"
+  install -m 0755 "$HERE/files/vrlink-latency" "$BIN_DIR/vrlink-latency"
   install -m 0644 "$HERE/files/quest-cable.service" "$UNIT_DIR/$UNIT"
   {
     echo "# Written by steamlink-usb-bazzite/install.sh"
@@ -605,7 +606,7 @@ uninstall() {
   ip=$(cat "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/quest-cable.blocked-ip" 2>/dev/null)
   systemctl --user disable --now "$UNIT" >/dev/null 2>&1 && ok "service stopped and disabled"
   [ -n "$ip" ] && [ -x "$HELPER" ] && sudo -n "$HELPER" off "$ip"
-  rm -f "$UNIT_DIR/$UNIT" "$BIN_DIR/quest-cable-daemon" "$CONF"
+  rm -f "$UNIT_DIR/$UNIT" "$BIN_DIR/quest-cable-daemon" "$BIN_DIR/vrlink-latency" "$CONF"
   systemctl --user daemon-reload
   ok "user files removed"
   nmcli connection delete "$NM_CON" >/dev/null 2>&1 && ok "NetworkManager profile removed"
@@ -659,6 +660,7 @@ if (( ${#ISSUES[@]} == 0 )); then
   connecting.
 
   Logs:    journalctl --user -u $UNIT -f
+  Latency: vrlink-latency   (per-stage timing of the last Steam Link session)
   Pause:   systemctl --user stop $UNIT   (until the next login)
   Remove:  $0 --uninstall
 EOF

@@ -54,6 +54,7 @@ VR game started from the desktop before connecting; Steam Link starts SteamVR it
 
 ```bash
 journalctl --user -u quest-cable -f       # what the service is doing
+vrlink-latency                            # per-stage latency of the last session (see Latency)
 systemctl --user stop quest-cable         # pause until the next login
 ./install.sh --uninstall                  # remove everything
 ```
@@ -72,6 +73,7 @@ screen is on when you connect.
 | `51-meta-quest.rules` | `/etc/udev/rules.d` | Lets adb open the Quest as your user (no reboot needed). |
 | `steamvr-setcap` + `.path` unit | `/usr/local/bin`, `/etc/systemd/system` | Re-grants `cap_sys_nice` to SteamVR's compositor after every SteamVR update. |
 | `LegacySteamRuntime` link | Steam's default library | Only when SteamVR lives in another library (see Troubleshooting). |
+| `vrlink-latency` | `~/.local/bin` | Reads SteamVR's frame-timing logs (see [Latency](#latency)). |
 | `quest-wifi-video-block` + sudoers rule | `/usr/local/bin`, `/etc/sudoers.d` | Wi-Fi video block, only used with an old vrlink (see below). |
 
 Every couple of seconds the daemon:
@@ -93,6 +95,34 @@ Options in `~/.config/quest-cable.conf` (then `systemctl --user restart quest-ca
 
 - `BLOCK_WIFI_VIDEO=auto|yes|no`: `auto` (default) blocks only without Uber link.
 - `KEEP_SCREEN_ON=yes|no`: step 2 above.
+
+## Latency
+
+SteamVR's vrlink driver writes per-frame timing to `~/.local/share/Steam/logs/vrlink_aftm_*.csv`
+on its own, and a per-15-second summary to `driver_vrlink.txt` (`[ProblemAttribution]` lines;
+`DecodeSlow` = the headset took longer than planned to decode a frame). `vrlink-latency` turns
+the CSV into a per-stage table. Measured here (Quest 3 on USB, RX 9060 XT, SteamVR 2.19.2 beta,
+November 2026), median / p95 in ms:
+
+| Stage | 90 Hz (3 sessions) | 120 Hz |
+| --- | --- | --- |
+| game + compositor (PC) | 2-6 / 2-6 | 8 / 9 |
+| encode (PC) | 6-8 / 6-8 | 9 / 10 |
+| network (USB + Wi-Fi) | 3-4 / 5-6 | 2.5 / 4 |
+| decode (headset) | 9-12 / 12-15 | 9 / 18 |
+| hold before display (headset) | 28 / 33-48 | 33 / 38 |
+| **total** | **50-51 / 54-71** | **57 / 58** |
+
+What this says:
+
+- The cable and the network are not the problem (2-6 ms).
+- The biggest share is the headset holding each decoded frame for ~30 ms before showing it: the
+  stream keeps a margin for decode-time spikes, so the less steady the decode, the larger that
+  hold and the more "floaty" the controllers feel. 15-46 % of frames were flagged `DecodeSlow`.
+- 120 Hz is not the culprit by itself: two 90 Hz sessions had worse p95 totals (62-71 ms).
+- The knob to try is what the headset has to decode: lower the resolution/quality in Steam
+  Link's settings in the headset, then compare `vrlink-latency` before and after. (Not yet
+  measured here; the files only hold the last ~4000 frames of each session.)
 
 ## Troubleshooting
 
@@ -131,10 +161,31 @@ November 2026). The installer and the service handle the first five; the logs na
   request to Steam (`Received streaming request` in `remote_connections.txt`), which then starts
   SteamVR and connects. Give it a few minutes; closing Steam Link in the headset and opening it
   again, or rebooting, also got it going. The cause is not known yet.
-- **"Allow USB debugging" every time.** Tick "Always allow from this computer". Apps that use adb
-  inside the headset (e.g. Quest Game Optimizer) ask on their own; granting them
-  `WRITE_SECURE_SETTINGS` once (`adb shell pm grant <package> android.permission.WRITE_SECURE_SETTINGS`)
-  usually stops their prompts.
+- **"Allow USB debugging" every time.** Tick "Always allow from this computer".
+- **Quest Game Optimizer keeps warning that ADB / wireless ADB is off.** Granting it
+  `WRITE_SECURE_SETTINGS` over the cable (`adb shell pm grant com.anagan.qgo
+  android.permission.WRITE_SECURE_SETTINGS`, plus `BATTERY_STATS` and `PACKAGE_USAGE_STATS`) let it
+  turn wireless debugging on by itself (`settings get global adb_wifi_enabled` became `1`), but
+  the warning stayed. Not solved yet; QGO may want the classic `adb tcpip 5555` mode, which is
+  lost on every headset reboot (untested, and it restarts adbd, so not while streaming).
+- **A Linux app added to Steam as a non-Steam shortcut does not start** (e.g. BSManager's
+  Flatpak). Check its Properties > Compatibility: a forced Proton runs `flatpak` under Wine and
+  nothing opens. Here Steam restored that setting even after removing it from `config.vdf` with
+  Steam closed; recreating the shortcut with another target (a small wrapper script) gives it a
+  new app id without the setting.
+- **Seeing what the headset shows**, without taking it off: `adb exec-out screencap -p > q.png`
+  (both eyes side by side). `adb logcat` lines tagged `SDL/APP` are Steam Link's own log
+  (pairing, streaming responses).
+
+## Beat Saber with BSManager mods
+
+Through Steam Link, a game only starts from the Steam library, and the Beat Saber there is the
+current Steam build (no mods). A version installed by BSManager (e.g. the 1.40.8 legacy build)
+can be added to Steam as a VR shortcut that runs it the way BSManager does:
+[`examples/beatsaber-bsmanager-instance.sh`](examples/beatsaber-bsmanager-instance.sh). Add it in
+Steam with "Add a Non-Steam Game", then in its properties keep compatibility **off** (the script
+calls Proton itself) and enable "Include in VR Library". To get mods in the Steam build instead,
+set its launch options to `WINEDLLOVERRIDES="winhttp=n,b" %command%`.
 
 ## Notes
 
