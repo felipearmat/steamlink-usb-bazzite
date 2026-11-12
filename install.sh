@@ -2,8 +2,9 @@
 # Steam Link VR over USB on Bazzite (Meta Quest).
 #
 # Checks every prerequisite, fixes what it can (always asking first) and installs the
-# quest-cable user service, which moves the Steam Link video to the USB cable whenever it is
-# available while the headset's Wi-Fi stays on.
+# quest-cable user service, which keeps the Quest's USB network up so SteamVR streams over the
+# cable, keeps the PC awake with the screen on while the headset is plugged in and awake, and
+# works around the SteamVR/Steam problems listed in the README's Troubleshooting section.
 #
 #   ./install.sh              check + install
 #   ./install.sh --check      only report what is missing, change nothing
@@ -581,6 +582,10 @@ install_service() {
     echo "ADB=\"$ADB\""
     echo "HEADSET_IP=\"${HEADSET_IP:-10.86.13.37}\""
     echo "STEAM_DIR=\"$STEAM_DIR\""
+    echo "# auto: block the Wi-Fi video only for an old vrlink without \"Uber link\" (yes/no to force)"
+    echo "BLOCK_WIFI_VIDEO=\"auto\""
+    echo "# yes: screen on and session kept active while the Quest is plugged in and awake"
+    echo "KEEP_SCREEN_ON=\"yes\""
   } > "$CONF"
   systemctl --user daemon-reload
   systemctl --user enable "$UNIT" >/dev/null 2>&1

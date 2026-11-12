@@ -3,17 +3,25 @@
 Play PC VR on a Meta Quest through **Steam Link over the USB cable** on Bazzite, while the
 headset's Wi-Fi stays on (Steam sign-in, PC discovery and controllers keep working).
 
-A small user service watches for a Steam Link session. Once the stream is running and the cable
-answers, it blocks the Steam Link video port over Wi-Fi, so SteamVR's vrlink driver sends the
-video through the cable instead. If anything goes wrong (cable unplugged, headset switching USB
-modes, stream ended), it unblocks immediately and the stream falls back to Wi-Fi instead of
-freezing. It works the same in desktop mode and in Gaming Mode (gamescope).
+Current SteamVR streams over every network path it finds at once ("Uber link"): with the Quest's
+USB networking up, the video goes through the cable, with Wi-Fi as a live backup. This project
+sets that up and keeps it working:
+
+- configures the headset's USB networking (NCM) and a static address on the PC side, and keeps
+  the headset in that mode (Horizon OS sometimes switches back to file transfer on its own);
+- keeps the PC session active and its screen on while the Quest is plugged in and awake (with
+  the screen off, the headset never manages to connect);
+- fixes the SteamVR and Steam problems that otherwise break the stream on Linux (see
+  [Troubleshooting](#troubleshooting)).
+
+It works the same in desktop mode and in Gaming Mode (gamescope).
 
 ## Requirements
 
 - Bazzite (other Fedora Atomic images should work), native Steam.
-- Steam client on the beta channel and **SteamVR on the beta branch** (both required: with the
-  stable SteamVR 2.18.4 the headset connects and the stream drops seconds later; 2.19 beta works).
+- Steam client on the **beta** channel and **SteamVR on the beta branch**. Both are required: with
+  the stable SteamVR (2.18.4, November 2026) the headset connects and the stream drops seconds
+  later; 2.19 beta works. The installer offers to switch both.
 - Meta Quest with **Developer Mode** enabled and **Steam Link** installed (beta channel).
 - A USB **data** cable (USB 3 recommended).
 
@@ -29,13 +37,16 @@ cd steamlink-usb-bazzite
 
 Connect the Quest with the cable and put it on before running it: the installer needs to accept
 the USB debugging prompt and to see the headset's USB network once. It asks before every change
-and needs your password once (for the firewall helper, and for `setcap` on SteamVR if needed).
+and needs your password once (firewall helper, udev rule, `setcap` on SteamVR). It also runs
+unattended (`--yes`, over SSH): with passwordless sudo it never waits for a graphical prompt.
+
+If the installer closes Steam (to switch a beta), reopen Steam **with the screen on**: see
+[Troubleshooting](#troubleshooting).
 
 ## Use
 
-1. Plug the Quest in and open **Steam Link** in the headset.
-2. Connect to the PC as usual. The session starts over Wi-Fi; a few seconds later the video moves
-   to the cable.
+1. Plug the Quest in and put it on. The PC screen turns on and the PC stays awake.
+2. Open **Steam Link** in the headset and connect to the PC.
 
 Nothing to run on the PC. The **first** connection from a headset asks for pairing: the headset
 shows a PIN and Steam opens a dialog on the PC's screen to type it (once per headset). Close any
@@ -47,65 +58,86 @@ systemctl --user stop quest-cable         # pause until the next login
 ./install.sh --uninstall                  # remove everything
 ```
 
+Over Wi-Fi only (no cable) the service cannot tell the headset is in use: make sure the PC's
+screen is on when you connect.
+
 ## How it works
 
 | Piece | Where | What it does |
 | --- | --- | --- |
 | `quest-cable-daemon` | `~/.local/bin` | The watch loop (see below). |
 | `quest-cable.service` | `~/.config/systemd/user` | Starts the daemon with every login. |
-| `quest-cable.conf` | `~/.config` | adb path, headset USB address, Steam folder. |
-| `quest-wifi-video-block` | `/usr/local/bin` | Adds/removes the two firewall rules (runtime only). |
-| sudoers rule | `/etc/sudoers.d/quest-wifi-video-block` | Lets the service run only that helper without a password. |
+| `quest-cable.conf` | `~/.config` | adb path, headset USB address, Steam folder, options below. |
 | `quest-usb` profile | NetworkManager | Static address on the headset's USB network. |
 | `51-meta-quest.rules` | `/etc/udev/rules.d` | Lets adb open the Quest as your user (no reboot needed). |
 | `steamvr-setcap` + `.path` unit | `/usr/local/bin`, `/etc/systemd/system` | Re-grants `cap_sys_nice` to SteamVR's compositor after every SteamVR update. |
 | `LegacySteamRuntime` link | Steam's default library | Only when SteamVR lives in another library (see Troubleshooting). |
+| `quest-wifi-video-block` + sudoers rule | `/usr/local/bin`, `/etc/sudoers.d` | Wi-Fi video block, only used with an old vrlink (see below). |
 
-Every couple of seconds the daemon checks, in this order (before that, it links
-`LegacySteamRuntime` into Steam's default library if Steam installed it elsewhere):
+Every couple of seconds the daemon:
 
-1. Quest on USB, reachable over adb, and the Steam Link app is running. Otherwise it does nothing.
-2. The headset USB is in networking (NCM) mode. Horizon OS sometimes switches back to file
-   transfer (MTP) on its own, so the daemon switches it back, at most once every 15 s.
-3. SteamVR's vrlink session for the current `vrserver` is up, the headset has been streaming for
-   8 s, and the headset answers a ping over the cable. Only then is the video port (UDP 10400)
-   between the PC and the headset's Wi-Fi address blocked in both directions.
+1. Links `LegacySteamRuntime` into Steam's default library if Steam installed it elsewhere
+   (needed over Wi-Fi too).
+2. If the Quest is on USB, reachable over adb and **awake**: wakes the PC's screen and holds an
+   idle inhibitor (the session stays active, the screen stays on, the PC does not suspend). It
+   lets go when the headset sleeps (taken off, or left charging) or is unplugged.
+3. If Steam Link is running: keeps the headset USB in networking (NCM) mode, switching it back
+   at most once every 15 s.
+4. Only with an old vrlink that lacks "Uber link": once the session is up, the headset has been
+   streaming for 8 s and answers over the cable, it blocks the video port (UDP 10400) between the
+   PC and the headset's Wi-Fi address so the video has to use the cable; unblocked at once if any
+   of that stops being true. With current SteamVR this is skipped: blocking Wi-Fi freezes the
+   stream.
 
-If any of these stops being true, the rules are removed at once. They are also removed when the
-service stops, and they never survive a reboot.
+Options in `~/.config/quest-cable.conf` (then `systemctl --user restart quest-cable`):
+
+- `BLOCK_WIFI_VIDEO=auto|yes|no`: `auto` (default) blocks only without Uber link.
+- `KEEP_SCREEN_ON=yes|no`: step 2 above.
 
 ## Troubleshooting
 
-Problems found while setting this up on a real Bazzite desktop (November 2026); the installer and
-the service now avoid the first three.
+All of these happened while setting this up on a real Bazzite desktop (Quest 3, RX 9060 XT,
+November 2026). The installer and the service handle the first five; the logs named here are in
+`~/.local/share/Steam/logs/`.
 
+- **The headset keeps "searching", and the PC's screen is off.** With the screen off (DPMS, KDE
+  Wayland) Steam still answers discovery, but the headset never sends its connection request
+  (nothing new in `remote_connections.txt`). The service now keeps the screen on while the Quest
+  is plugged in and awake; over Wi-Fi only, turn the screen on yourself.
 - **Connects, then "the PC stopped streaming" and SteamVR crashes.** `vrserver.txt` shows
-  `timeout - vrcompositor process is not running` and `Failed Watchdog timeout ... Aborting`, and
-  `vrstartup-linux.txt` loops on `vrcompositor-launcher.sh: Relaunch under scout LDLP runtime`
-  until `Argument list too long`. Two causes, both required to fix:
+  `timeout - vrcompositor process is not running` and `Failed Watchdog timeout ... Aborting`;
+  `vrstartup-linux.txt` loops on `Relaunch under scout LDLP runtime` until `Argument list too
+  long`. Two causes, both fixed:
   - SteamVR on the stable branch: switch it to the beta (`install.sh` offers to).
-  - SteamVR in a library other than Steam's default one: the launcher looks for the
+  - SteamVR in a library other than Steam's default one: `vrcompositor-launcher.sh` looks for the
     `LegacySteamRuntime` tool (appid 4690330) only in the default library, while Steam installs
-    it next to SteamVR. Fix: `ln -s <library>/steamapps/common/LegacySteamRuntime
-    ~/.local/share/Steam/steamapps/common/LegacySteamRuntime` (done automatically).
+    it next to SteamVR, the first time SteamVR starts. The installer and the service link it:
+    `~/.local/share/Steam/steamapps/common/LegacySteamRuntime -> <library>/steamapps/common/LegacySteamRuntime`.
+- **Connects, then the image freezes.** `driver_vrlink.txt` restarts its Wi-Fi socket every
+  second (`RXThread start (<PC LAN address>)`). That was this project blocking the Wi-Fi video
+  while vrlink's Uber link was using it; now only done for an old vrlink.
 - **Steam stuck at "Installing update..." forever.** Steam's update window blocks the whole
-  client while the screen is off (DPMS) on KDE Wayland, e.g. when Steam is restarted over SSH or
-  after the display went to sleep. Turn the screen on (`kscreen-doctor --dpms on` from a shell
-  in the session) and it continues by itself.
-- **`install.sh` waits forever when run without a terminal.** Fixed: it uses `sudo` directly
-  when it needs no password, instead of a `pkexec` dialog on the local screen.
-- **The headset keeps "searching".** Check `~/.local/share/Steam/logs/remote_connections.txt`:
+  client while the screen is off, e.g. when Steam is restarted over SSH or after the display went
+  to sleep. Turn the screen on (`kscreen-doctor --dpms on` from a shell in the session) and it
+  continues by itself. The installer reminds you whenever it closes Steam.
+- **`install.sh` waits forever when run without a terminal.** It used `pkexec`, which opens a
+  password dialog on the local screen. It now uses `sudo` directly when it needs no password.
+- **The headset keeps "searching" (screen on).** Check `remote_connections.txt`:
   `k_ERemoteDeviceStreamingUnauthorized` means the headset is not paired yet; look for the PIN
   dialog on the PC's screen.
+- **Stuck on "Connecting..." after a disconnect, a headset reboot or a PC reboot.** Seen after
+  changing the headset refresh rate: the headset first keeps sending to SteamVR's vrlink port
+  (UDP 10400) as if resuming the old session, and only some minutes later sends the normal
+  request to Steam (`Received streaming request` in `remote_connections.txt`), which then starts
+  SteamVR and connects. Give it a few minutes; closing Steam Link in the headset and opening it
+  again, or rebooting, also got it going. The cause is not known yet.
+- **"Allow USB debugging" every time.** Tick "Always allow from this computer". Apps that use adb
+  inside the headset (e.g. Quest Game Optimizer) ask on their own; granting them
+  `WRITE_SECURE_SETTINGS` once (`adb shell pm grant <package> android.permission.WRITE_SECURE_SETTINGS`)
+  usually stops their prompts.
 
 ## Notes
 
-- **Valve's own USB mode.** SteamVR 2.18 (October 2026) added official wired USB support for the
-  Quest in Steam Link, built on the same USB networking (NCM). It was announced for Windows and
-  has not been confirmed on Linux yet (the vrlink driver does open a socket on the USB
-  interface, next to Wi-Fi). This service does not get in its way: if the official
-  mode already sends the video over the cable, blocking the Wi-Fi video port changes nothing; if
-  it does not, the service still moves the video to the cable.
 - **adb.** The installer downloads Google's `platform-tools-latest-linux.zip` first. The
   Homebrew cask (`android-platform-tools`) pins a versioned URL that Google sometimes removes
   (it returned 404 in November 2026), so it is only offered as a fallback.
@@ -113,19 +145,14 @@ the service now avoid the first three.
   the `steamvr-setcap.path` unit grants it again automatically, so SteamVR does not start
   asking for a password (an invisible dialog in Gaming Mode) after an update.
 - **Beat Saber black screen.** If the game shows a black void through Steam Link, the usual fix
-  on Linux is the legacy 1.40.8 build (Properties > Betas).
+  on Linux is the legacy 1.40.8 build (Properties > Betas, or a BSManager instance).
 - **Bazzite-Deck: the Steam beta channel also moves the OS to `:testing`.** On the `bazzite-deck`
   images, Steam in the beta channel (shown as "RC" in the client) calls `steamos-select-branch
   beta` every time its UI loads, and Bazzite maps that to a rebase to the `:testing` image
   ([ublue-os/bazzite#5938](https://github.com/ublue-os/bazzite/issues/5938),
   [#1543](https://github.com/ublue-os/bazzite/issues/1543)). Steam Link VR needs the Steam beta,
-  so expect the OS to follow it. To stay on `:stable` anyway you can switch the Steam client
-  back to stable (Steam Link VR then stops working) or try denying the `pkexec` call to
-  `steamos-polkit-helpers/steamos-select-branch` with a polkit rule (not tested here). The
-  desktop images (`bazzite`, KDE/GNOME) do not ship that hook: a desktop install with the Steam
-  beta stayed on `:stable` (tested November 2026).
+  so expect the OS to follow it. The desktop images (`bazzite`, KDE/GNOME) do not ship that hook:
+  a desktop install with the Steam beta stayed on `:stable` (tested November 2026).
 - If the headset shows **"Allow access to data?"** / file transfer, dismiss it: accepting switches
-  the USB to MTP (the service switches it back, but the stream briefly falls back to Wi-Fi).
-- Leaving the stream (Meta button > quit, or restarting SteamVR) unblocks Wi-Fi; reconnecting
-  works as usual.
-- The firewall rules only touch UDP port 10400 for the headset's current Wi-Fi address.
+  the USB to MTP (the service switches it back to networking).
+- Leaving the stream (Meta button > quit, or restarting SteamVR) and reconnecting works as usual.

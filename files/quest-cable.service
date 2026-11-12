@@ -1,5 +1,5 @@
 [Unit]
-Description=Steam Link VR: send the Quest video over the USB cable when available
+Description=Steam Link VR: keep the Quest USB network up and the PC awake while the headset is in use
 
 [Service]
 ExecStart=%h/.local/bin/quest-cable-daemon
