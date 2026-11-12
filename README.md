@@ -120,9 +120,27 @@ What this says:
   stream keeps a margin for decode-time spikes, so the less steady the decode, the larger that
   hold and the more "floaty" the controllers feel. 15-46 % of frames were flagged `DecodeSlow`.
 - 120 Hz is not the culprit by itself: two 90 Hz sessions had worse p95 totals (62-71 ms).
-- The knob to try is what the headset has to decode: lower the resolution/quality in Steam
-  Link's settings in the headset, then compare `vrlink-latency` before and after. (Not yet
-  measured here; the files only hold the last ~4000 frames of each session.)
+- It is not the video quality: lower settings did not remove the delay, and the same headset
+  feels fine standalone and with Steam Link on Windows.
+- `DecodeSlow` follows the content (near 0 % in menus, 30-90 % in game) and swings widely in
+  15-second windows. `driver_vrlink.txt` has the per-15-second counts:
+  `grep '\[ProblemAttribution\]' ~/.local/share/Steam/logs/driver_vrlink.txt`.
+- **Lead being tested (not confirmed):** the only session with almost no `DecodeSlow` (0.06 %)
+  was one where the video went over the cable only; every Uber-link session (video over cable
+  and Wi-Fi at once) had 15-90 %. To test video over the cable only, turn Uber link off in
+  `~/.local/share/Steam/config/steamvr.vrsettings` (SteamVR closed):
+
+  ```json
+  "driver_vrlink" : { "disableUberLink" : true }
+  ```
+
+  With Uber link off, the service's `BLOCK_WIFI_VIDEO=auto` sees no "Uber link enabled" in
+  `vrserver.txt` and goes back to the original method: once the session is up it blocks the
+  video port on Wi-Fi, so the video has to use the cable while Wi-Fi keeps carrying sign-in
+  and control. Remove the key to undo.
+- Other vrlink settings found in `driver_vrlink.so` (accepted values unknown, untested):
+  `allowMultipleLinks`, `maxVideoQueueLatencyUs`, `reqEncMode` (the log shows `mid`),
+  `streamQuality`, `enableQoS`, `forceBaselineVideoFEC`, `enableEncryption`.
 
 ## Troubleshooting
 
@@ -152,6 +170,16 @@ November 2026). The installer and the service handle the first five; the logs na
   continues by itself. The installer reminds you whenever it closes Steam.
 - **`install.sh` waits forever when run without a terminal.** It used `pkexec`, which opens a
   password dialog on the local screen. It now uses `sudo` directly when it needs no password.
+- **"Connecting..." forever right after the headset was plugged in or woke up.** The headset
+  itself sometimes re-enumerates its USB (product id 5018 -> 5013 -> 5018 in `journalctl -k`),
+  which drops and recreates the cable network; a connection request sent in that window never
+  reaches the PC (`remote_connections.txt` only shows the later cancel). Cancel and connect
+  again, or unplug and replug the cable: the next request goes through at once.
+- **The headset Wi-Fi must stay on.** Steam Link signs in to Steam's servers before it asks the
+  PC to stream; the cable network gives the headset no internet (Horizon OS treats it as a
+  downstream tethering link), so with Wi-Fi off it stays on "Connecting...". Giving the headset
+  internet over the cable would need a reverse-tethering VPN over adb (e.g. gnirehtet), which
+  could also pull the video off the direct cable path; not tried.
 - **The headset keeps "searching" (screen on).** Check `remote_connections.txt`:
   `k_ERemoteDeviceStreamingUnauthorized` means the headset is not paired yet; look for the PIN
   dialog on the PC's screen.
