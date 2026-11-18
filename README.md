@@ -69,7 +69,7 @@ screen is on when you connect.
 | `quest-cable-daemon` | `~/.local/bin` | The watch loop (see below). |
 | `quest-cable.service` | `~/.config/systemd/user` | Starts the daemon with every login. |
 | `quest-cable.conf` | `~/.config` | adb path, headset USB address, Steam folder, options below. |
-| `quest-usb` profile | NetworkManager | Static address on the headset's USB network. |
+| `quest-usb` profile | NetworkManager | Static address on the headset's USB network; matched by driver (`cdc_ncm`), so it works on any USB port. |
 | `51-meta-quest.rules` | `/etc/udev/rules.d` | Lets adb open the Quest as your user (no reboot needed). |
 | `steamvr-setcap` + `.path` unit | `/usr/local/bin`, `/etc/systemd/system` | Re-grants `cap_sys_nice` to SteamVR's compositor after every SteamVR update. |
 | `LegacySteamRuntime` link | Steam's default library | Only when SteamVR lives in another library (see Troubleshooting). |
@@ -148,6 +148,18 @@ All of these happened while setting this up on a real Bazzite desktop (Quest 3, 
 November 2026). The installer and the service handle the first five; the logs named here are in
 `~/.local/share/Steam/logs/`.
 
+- **Steam Link error 450 ("the streaming PC does not respond") after moving the cable to another USB port.**
+  The USB network interface name depends on the port (e.g. `enp14s0f3u1u1i3` vs `enp1s0f0u1u1i3`).
+  Older installs bound the `quest-usb` profile to the name of the port used at install time, so on another
+  port the profile never came up and the PC had no headset-side address. The installer now matches by driver;
+  to fix an existing profile without reinstalling:
+  `nmcli con mod quest-usb connection.interface-name "" match.driver cdc_ncm`. The daemon already finds the
+  interface by vendor id, so only the profile was stuck.
+- **"Protocol error" / `-71` in adb and on the cable network.** Seen with USB hubs and one-port extensions:
+  plug the cable into a port directly on the motherboard.
+- **ALVR instead of Steam Link did not work here.** Tested and reverted. With `vrmonitor.sh %command%` as
+  the SteamVR launch option, SteamVR's own Qt 5.5 `vrmonitor` loads the host's OpenSSL 4 and crashes, and the
+  compositor then falls back to radv (`wsi_WaitForPresentKHR`). Not pursued further.
 - **The headset keeps "searching", and the PC's screen is off.** With the screen off (DPMS, KDE
   Wayland) Steam still answers discovery, but the headset never sends its connection request
   (nothing new in `remote_connections.txt`). The service now keeps the screen on while the Quest

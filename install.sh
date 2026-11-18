@@ -473,7 +473,9 @@ setup_nm_profile() {
     return 0
   fi
   [ -n "$PC_IP" ] || { bad "profile not created: USB network not detected"; return 1; }
-  local args=(connection.interface-name "$QUEST_IFACE" connection.autoconnect yes
+  # Match by driver, not by interface name: the name (enp14s0f3u1u1i3) depends on the USB port the headset
+  # is plugged into, so a name-bound profile stops working as soon as the cable moves to another port.
+  local args=(connection.interface-name "" match.driver cdc_ncm connection.autoconnect yes
               ipv4.method manual ipv4.addresses "$PC_IP/$HEADSET_PREFIX" ipv4.never-default yes
               ipv6.method disabled)
   if (( exists )); then
